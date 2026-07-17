@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8" standalone="no" ?>
+<vehicle type="tractor">
+    <base>
+        <typeDesc>Test</typeDesc>
+    <wheels count="4" />
+</vehicle>

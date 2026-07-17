@@ -1,0 +1,12 @@
+# Report-Ausgaben des Skripts (enthalten lokale Pfade)
+xml-fehler.csv
+*.report.csv
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp

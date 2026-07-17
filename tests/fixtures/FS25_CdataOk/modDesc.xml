@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8" standalone="no" ?>
+<modDesc descVersion="98">
+    <script><![CDATA[ if (a < b) { -- x } -- <!-- kein echter Kommentar ]]></script>
+</modDesc>

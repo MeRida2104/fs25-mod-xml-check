@@ -1,0 +1,8 @@
+* text=auto
+
+# Fixtures sind Testdaten - Zeilenenden nicht anfassen, damit die in den Tests
+# erwarteten Zeilennummern reproduzierbar bleiben.
+tests/fixtures/** -text
+
+*.ps1 text eol=crlf
+*.md  text eol=lf
