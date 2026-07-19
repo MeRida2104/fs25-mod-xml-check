@@ -35,6 +35,13 @@ $expected = @(
     @{ Mod = 'FS25_BadClose';        Art = 'Trennlinien-Kommentar';        Zeile = 3 }
     @{ Mod = 'FS25_UnclosedTag';     Art = 'Falsch verschachteltes Tag';   Zeile = 6 }
     @{ Mod = 'FS25_MismatchTag';     Art = 'Falsch verschachteltes Tag';   Zeile = 3 }
+    @{ Mod = 'FS25_MissingRef';      Art = 'Fehlende Datei';               Zeile = 5 }
+    @{ Mod = 'FS25_BadCase';         Art = 'Gross-/Kleinschreibung';       Zeile = 5 }
+    @{ Mod = 'FS25_PngDds';          Art = $null;                          Zeile = $null }
+    @{ Mod = 'FS25_WavOgg';          Art = $null;                          Zeile = $null }
+    @{ Mod = 'FS25_GrlePng';         Art = $null;                          Zeile = $null }
+    @{ Mod = 'FS25_MapRelative';     Art = $null;                          Zeile = $null }
+    @{ Mod = 'FS25_CommentedRef';    Art = $null;                          Zeile = $null }
     @{ Mod = 'FS25_Good';            Art = $null;                          Zeile = $null }
     @{ Mod = 'FS25_CdataOk';         Art = $null;                          Zeile = $null }
 )
@@ -168,6 +175,44 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------------------------------------------------------------------
+# Durchgang 3: Savegame-Pruefung (-SavegamePath)
+# ------------------------------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'Savegame-Pruefung' -ForegroundColor Cyan
+
+$saveRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("fs25xmlsave_" + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $saveRoot -Force
+
+try {
+    # Ein sauberes und ein kaputtes (Tag nicht geschlossen) Savegame-XML.
+    Set-Content -LiteralPath (Join-Path $saveRoot 'farms.xml') `
+                -Value "<?xml version=`"1.0`"?><farms></farms>" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $saveRoot 'vehicles.xml') `
+                -Value "<?xml version=`"1.0`"?>`n<vehicles>`n  <vehicle>`n</vehicles>" -Encoding UTF8
+
+    $saveResults = @(& $script -Path $fixtures -SavegamePath $saveRoot -PassThru 6>$null)
+
+    $saveHit = $saveResults | Where-Object { $_.Typ -eq 'Savegame' -and $_.Datei -eq 'vehicles.xml' } | Select-Object -First 1
+    if ($saveHit) {
+        Write-Pass "Savegame: kaputte vehicles.xml als Typ 'Savegame' gemeldet"
+    }
+    else {
+        Write-Fail "Savegame: kaputte vehicles.xml wurde nicht gemeldet"
+    }
+
+    if (@($saveResults | Where-Object { $_.Typ -eq 'Savegame' -and $_.Datei -eq 'farms.xml' }).Count -eq 0) {
+        Write-Pass "Savegame: saubere farms.xml korrekt nicht gemeldet"
+    }
+    else {
+        Write-Fail "Savegame: saubere farms.xml faelschlich gemeldet"
+    }
+}
+finally {
+    Remove-Item -LiteralPath $saveRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ------------------------------------------------------------------------------------------------

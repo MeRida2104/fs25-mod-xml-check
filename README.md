@@ -65,6 +65,47 @@ die die Ursache benennt und lokalisiert:
 | `modDesc.xml` im Unterordner des Zips | einmal zu viel gezippt — FS25 lädt den Mod nicht |
 | Defektes Archiv | `.zip` lässt sich nicht öffnen, z.B. abgebrochener Download |
 
+### Zusätzlich: Dateiverweise (Hinweise)
+
+Bei **wohlgeformten** Dateien werden die Verweise geprüft — genau die Klasse Fehler, die im Log
+als `Error: Failed to open xml file ...` auftaucht und die ein reiner XML-Parser nie findet:
+
+| Befund | Beispiel |
+|---|---|
+| Fehlende Datei | `<i3dFilename>foo.i3d</i3dFilename>` — Datei existiert im Mod nicht |
+| Groß-/Kleinschreibung | Verweis `icon/mod.dds`, Datei heißt `icon/Mod.dds` — im Zip und auf Linux-Servern ein Ladefehler |
+
+Geprüft werden Werte, die auf eine bekannte Asset-Endung enden (`.i3d`, `.xml`, `.dds`, `.png`,
+`.grle`, `.gdm`, `.cache`, `.shapes`, `.lua`, `.wav`, `.ogg`, `.anim`, `.gls`). Verweise ins
+Basisspiel (`$data`, `data/`), mit Platzhaltern (`$…`, `%…`), URLs, absolute Pfade und Pfade mit
+`..` werden ausgelassen, damit keine Fehlalarme entstehen — ebenso Mods, deren `modDesc.xml` nicht
+im Wurzelverzeichnis liegt (dort lässt sich die Mod-Wurzel nicht bestimmen).
+
+Aufgelöst wird gegen **zwei Basen**: die Mod-Wurzel *und* den Ordner der XML selbst. Fahrzeug- und
+`modDesc`-XMLs verweisen relativ zur Mod-Wurzel (`store/foo.dds`), Foliage-/Map-XMLs dagegen
+relativ zu ihrem eigenen Ordner — eine `maps/foliage/soybean/soybean.xml` mit `<filename>soybean.i3d</filename>`
+meint die `soybean.i3d` **im selben Ordner**. Existiert die Datei an einer der beiden Basen, gilt
+der Verweis als aufgelöst.
+
+**Auskommentierte** Verweise (`<!-- … -->`) und Pfade in `<![CDATA[…]]>` werden vor der Prüfung
+ausgeblendet und lösen deshalb keinen Fund aus — die Zeilennummern der übrigen Befunde bleiben
+dabei korrekt.
+
+Einige Endungen gelten dabei als **austauschbar**, weil die Engine sie automatisch auflöst:
+`.png` ↔ `.dds` ↔ `.grle` (Texturen/Icons/Masken) und `.wav` ↔ `.ogg` (Sounds). Eine referenzierte
+`store/foo.png` ist also nicht „fehlend", wenn `store/foo.dds` (oder `.grle`) vorhanden ist, und
+eine `sounds/bar.wav` nicht, wenn `sounds/bar.ogg` vorliegt — jeweils auch umgekehrt.
+
+Diese Verweis-Hinweise werden gemeldet, setzen den **Exitcode aber nicht** auf 1 — eine fehlende
+`.dds`-Textur blockiert den Serverstart in aller Regel nicht. Abschalten mit `-SkipReferenceCheck`.
+
+### Zusätzlich: Savegame-Prüfung
+
+Ein durch einen harten Stopp halb geschriebenes Savegame ist eine der Hauptursachen dafür, dass
+der Server zwar **stoppt, aber nicht mehr lädt**. Mit `-SavegamePath` werden alle XML-Dateien des
+Savegames (`vehicles.xml`, `items.xml`, `farms.xml` …) auf Wohlgeformtheit geprüft — dieselbe
+echte Parser-Prüfung wie bei den Mods. Ein Parserfehler dort setzt den Exitcode auf 1.
+
 ## Benutzung
 
 ```powershell
@@ -81,10 +122,17 @@ die die Ursache benennt und lokalisiert:
 | Parameter | Bedeutung |
 |---|---|
 | `-Path` | Wurzelverzeichnis mit Mod-Ordnern und/oder `.zip`-Mods (Standard: Ordner des Skripts) |
+| `-SavegamePath` | prüft zusätzlich alle XML-Dateien dieses Savegame-Verzeichnisses auf Wohlgeformtheit |
+| `-SkipReferenceCheck` | schaltet die Verweisprüfung (fehlende / falsch geschriebene Dateien) ab |
 | `-CsvPath` | schreibt alle Fundstellen als CSV (UTF-8, `;`-getrennt) |
 | `-MaxHints` | Fundstellen pro Datei in der Konsole (Standard 6) |
 | `-PassThru` | gibt die Befunde als Objekte auf die Pipeline |
 | `-IncludeOk` | zeigt zusätzlich die Anzahl geprüfter Dateien |
+
+```powershell
+# Mods und das aktive Savegame in einem Lauf prüfen
+.\Test-FS25ModXml.ps1 -Path 'C:\FS25\mods' -SavegamePath 'C:\FS25\savegame1'
+```
 
 Geprüft werden Mod-Ordner und `.zip`-Dateien direkt unterhalb des Wurzelverzeichnisses. Zips
 *innerhalb* von Mod-Ordnern werden nicht geöffnet — die lädt FS25 auch nicht.
@@ -157,15 +205,16 @@ eigene Fixture.
 .\tests\Invoke-Tests.ps1
 ```
 
-`tests/fixtures/` enthält acht Mini-Mods: sechs mit je einem bekannten Defekt und zwei bewusst
-fehlerfreie, darunter der CDATA-Fall. Getestet wird nicht nur, *ob* ein Fehler erkannt wird,
-sondern auch dessen Art und Zeilennummer — denn genau die Zeilennummer ist der Mehrwert
-gegenüber einem nackten Parser.
+`tests/fixtures/` enthält zehn Mini-Mods: sechs mit je einem Parser-Defekt, zwei mit einem
+Verweis-Defekt (fehlende Datei, Groß-/Kleinschreibung) und zwei bewusst fehlerfreie, darunter der
+CDATA-Fall. Getestet wird nicht nur, *ob* ein Fehler erkannt wird, sondern auch dessen Art und
+Zeilennummer — denn genau die Zeilennummer ist der Mehrwert gegenüber einem nackten Parser.
 
 Derselbe Erwartungskatalog läuft zweimal: gegen die entpackten Fixture-Ordner und gegen daraus
 erzeugte `.zip`-Mods. Die Zips baut der Test zur Laufzeit in einem Temp-Ordner — so liegen keine
 Binärdateien im Repo, und beide Pfade liefern nachweislich dieselben Befunde. Dazu kommen zwei
-Zip-Sonderfälle: einmal zu viel gezippt und ein defektes Archiv.
+Zip-Sonderfälle (einmal zu viel gezippt, defektes Archiv) und ein dritter Durchgang, der die
+`-SavegamePath`-Prüfung gegen ein kaputtes und ein sauberes Savegame-XML testet.
 
 ## Anforderungen
 

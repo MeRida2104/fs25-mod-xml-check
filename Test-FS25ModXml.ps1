@@ -32,6 +32,14 @@
     wenn sie zwar existiert, aber im Unterordner statt im Archiv-Wurzelverzeichnis liegt (der
     klassische "einmal zu viel gezippt"-Fehler; FS25 laedt so einen Mod gar nicht erst).
 
+    Ueber die reine XML-Syntax hinaus werden bei wohlgeformten Dateien die *Dateiverweise*
+    geprueft: zeigt ein <i3dFilename>, <filename>, iconFilename o.ae. auf eine Datei, die im
+    Mod nicht existiert (typischer "Error: Failed to open xml file ..."), wird das als Hinweis
+    gemeldet - ebenso eine nur in der Gross-/Kleinschreibung abweichende Datei, die im Zip und
+    auf Linux-Servern zum Ladefehler wird. Verweise ins Basisspiel ($data, data/) sowie mit
+    Platzhaltern ($, %) werden ausgelassen, weil sie sich nicht statisch aufloesen lassen.
+    Diese Verweis-Hinweise setzen den Exitcode NICHT auf 1 - nur echte XML-Parserfehler tun das.
+
     Dateien und Archive werden mit FileShare ReadWrite geoeffnet, der Scan funktioniert also auch
     bei laufendem Server.
 
@@ -41,6 +49,15 @@
 
 .PARAMETER CsvPath
     Optional. Schreibt alle Befunde zusaetzlich als CSV (UTF-8) in diese Datei.
+
+.PARAMETER SavegamePath
+    Optional. Prueft zusaetzlich alle XML-Dateien eines Savegame-Verzeichnisses auf
+    Wohlgeformtheit (vehicles.xml, items.xml, farms.xml ...). Ein durch einen harten Stopp
+    halb geschriebenes Savegame ist eine der Hauptursachen dafuer, dass der Server zwar
+    stoppt, aber nicht mehr laedt. Verweispruefung laeuft hier bewusst nicht.
+
+.PARAMETER SkipReferenceCheck
+    Optional. Schaltet die Verweispruefung ab (fehlende / falsch geschriebene Dateien).
 
 .PARAMETER IncludeOk
     Optional. Listet am Ende auch die Anzahl der geprueften Dateien auf.
@@ -61,6 +78,13 @@ param(
     [string]$Path,
 
     [string]$CsvPath,
+
+    # Zusaetzlich das aktive Savegame-Verzeichnis auf wohlgeformte XML pruefen. Ein durch einen
+    # harten Stopp korruptes Savegame ist eine der Hauptursachen fuer "stoppt, startet nicht mehr".
+    [string]$SavegamePath,
+
+    # Verweise auf fehlende / falsch geschriebene Dateien (i3d, xml, dds ...) nicht pruefen.
+    [switch]$SkipReferenceCheck,
 
     [int]$MaxHints = 6,
 
@@ -402,6 +426,147 @@ function Get-XmlHint {
 }
 
 # ------------------------------------------------------------------------------------------------
+# Hilfsfunktionen: Verweispruefung (fehlende / falsch geschriebene Dateien)
+# ------------------------------------------------------------------------------------------------
+
+# Bekannte Asset-Endungen. Nur Werte, die auf eine davon enden, gelten als Dateiverweis - so
+# fallen Node-Pfade ("0>1|2"), Zahlen und normaler Text von selbst raus.
+$script:RefExtensions = @('i3d','xml','dds','png','grle','gdm','cache','shapes','lua','wav','ogg','anim','gls')
+
+# Laesst sich ein Verweis ueberhaupt statisch gegen den Mod aufloesen? Basisspiel-, Platzhalter-,
+# URL- und absolute Pfade werden ausgelassen, damit keine Fehlalarme entstehen.
+function Test-IsResolvableRef {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if ($Path -match '[\$%*?<>|]')        { return $false }   # Variablen / Platzhalter / Wildcards
+    if ($Path -match '://')               { return $false }   # URL
+    if ($Path -match '^[A-Za-z]:[\\/]')   { return $false }   # C:\...
+    if ($Path -match '^[\\/]')            { return $false }   # /... (absolut)
+    if ($Path -match '^data/')            { return $false }   # zeigt ins Basisspiel, nicht in den Mod
+    if ($Path -match '(^|/)\.\.(/|$)')    { return $false }   # ../ laesst sich nicht sicher aufloesen
+
+    return $true
+}
+
+# Endungen, die die Engine als austauschbar behandelt: Mods referenzieren oft die eine, liefern
+# aber die andere aus (die Engine loest das automatisch auf). Innerhalb einer Gruppe gilt jede
+# Endung als gleichwertig.
+$script:InterchangeableGroups = @(
+    @('png', 'dds', 'grle'),   # Texturen / Icons / Masken
+    @('wav', 'ogg')            # Sounds
+)
+
+# Liefert zu einem kleingeschriebenen Schluessel alle gleichwertigen Alternativen (gleicher Pfad,
+# andere Endung derselben Gruppe).
+function Get-AltKeys {
+    param([string]$Key)
+
+    $alts = New-Object System.Collections.Generic.List[string]
+    $dot  = $Key.LastIndexOf('.')
+    if ($dot -lt 0) { return $alts }
+
+    $base = $Key.Substring(0, $dot)
+    $ext  = $Key.Substring($dot + 1)
+
+    foreach ($group in $script:InterchangeableGroups) {
+        if ($group -contains $ext) {
+            foreach ($other in $group) {
+                if ($other -ne $ext) { $alts.Add("$base.$other") }
+            }
+        }
+    }
+    return $alts
+}
+
+# Blendet Kommentare und CDATA aus, indem ihr Inhalt durch Leerzeichen ersetzt wird (Zeilen-
+# umbrueche bleiben erhalten). So zaehlen auskommentierte Verweise nicht als Datei, und weil die
+# Zeichen-Offsets unveraendert bleiben, stimmen die gemeldeten Zeilennummern weiterhin.
+# Laeuft nur auf wohlgeformten Dateien - dort sind Kommentare/CDATA immer sauber geschlossen.
+function Hide-XmlCommentsAndCData {
+    param([string]$Text)
+
+    $rx = [regex]'(?s)<!--.*?-->|<!\[CDATA\[.*?\]\]>'
+    $ev = [System.Text.RegularExpressions.MatchEvaluator] { param($m) $m.Value -replace '[^\r\n]', ' ' }
+    return $rx.Replace($Text, $ev)
+}
+
+# Prueft die Dateiverweise einer wohlgeformten XML gegen die tatsaechlich vorhandenen Dateien
+# des Mods. $Present: Schluessel = kleingeschriebener Relativpfad (mit '/'), Wert = Originalpfad.
+function Get-ReferenceFinding {
+    param(
+        [string]$Text, [int[]]$LineStarts,
+        [System.Collections.Generic.Dictionary[string, string]]$Present,
+        [string]$BaseDir = ''
+    )
+
+    $findings = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrEmpty($Text) -or $null -eq $Present -or $Present.Count -eq 0) { return $findings }
+
+    # Verweise werden gegen zwei Basen aufgeloest: die Mod-Wurzel ('') und den Ordner der XML
+    # selbst. Foliage-/Map-XMLs (z.B. maps/foliage/soybean/soybean.xml) referenzieren i3d und
+    # Texturen relativ zu ihrem eigenen Ordner, Fahrzeug-/modDesc-XMLs relativ zur Mod-Wurzel.
+    $baseLower = ($BaseDir -replace '\\', '/').ToLowerInvariant()
+    $bases     = if ($baseLower) { @('', $baseLower) } else { @('') }
+
+    # Attributwerte ("..." / '...') und Elementtext (>...<) in einem Durchgang.
+    $refRegex = [regex]'"([^"]*)"|''([^'']*)''|>([^<>]+)<'
+    $endsWith = '\.(' + ($script:RefExtensions -join '|') + ')$'
+
+    # Auskommentierte und in CDATA stehende Verweise ausblenden (Offsets bleiben erhalten).
+    $scan = Hide-XmlCommentsAndCData -Text $Text
+
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($m in $refRegex.Matches($scan)) {
+        $raw = if     ($m.Groups[1].Success) { $m.Groups[1].Value }
+               elseif ($m.Groups[2].Success) { $m.Groups[2].Value }
+               else                          { $m.Groups[3].Value }
+
+        $norm = ((($raw.Trim()) -replace '\\', '/') -replace '^\./', '')
+        if ($norm -notmatch $endsWith)               { continue }   # kein Dateiname mit Asset-Endung
+        if (-not (Test-IsResolvableRef -Path $norm)) { continue }
+
+        $key = $norm.ToLowerInvariant()
+        if (-not $seen.Add($key)) { continue }                      # jeden Verweis nur einmal melden
+
+        $line = ConvertTo-LineNumber -LineStarts $LineStarts -CharIndex $m.Index
+
+        # An welcher Basis existiert die Datei? Gleiche Endung zuerst, dann austauschbare
+        # (.png/.dds/.grle, .wav/.ogg). Der Case-Check laeuft nur beim exakten Wurzel-Treffer.
+        $resolved      = $false
+        $exactRootOrig = $null
+        foreach ($base in $bases) {
+            $exact = $base + $key
+            if ($Present.ContainsKey($exact)) {
+                $resolved = $true
+                if ($base -eq '') { $exactRootOrig = $Present[$exact] }
+                break
+            }
+            $altHit = $false
+            foreach ($a in (Get-AltKeys -Key $exact)) {
+                if ($Present.ContainsKey($a)) { $altHit = $true; break }
+            }
+            if ($altHit) { $resolved = $true; break }
+        }
+
+        if ($resolved) {
+            # Nur beim exakten Wurzel-Treffer (gleiche Endung) auf Gross-/Kleinschreibung pruefen.
+            if ($exactRootOrig -and ($exactRootOrig -cne $norm)) {
+                $findings.Add((New-Finding 'Gross-/Kleinschreibung' $line `
+                    "Verweis '$norm' - die Datei heisst tatsaechlich '$exactRootOrig'. Im Zip und auf Linux-Servern ist das ein Ladefehler."))
+            }
+            continue
+        }
+
+        $findings.Add((New-Finding 'Fehlende Datei' $line `
+            "Verweis auf '$norm' - Datei fehlt im Mod. FS25 meldet dazu 'Error: Failed to open ...' und laedt sie nicht."))
+    }
+
+    return $findings
+}
+
+# ------------------------------------------------------------------------------------------------
 # Scanner pro Mod
 # ------------------------------------------------------------------------------------------------
 
@@ -424,39 +589,71 @@ function New-XmlResult {
     }
 }
 
-# Rueckgabe: Results = fehlerhafte Dateien, FileCount = geprueft, ModDesc = 'Ok' | Klartextgrund.
+# Rueckgabe: Results = auffaellige Dateien, FileCount = geprueft, ModDesc = 'Ok' | Klartextgrund.
 function Invoke-FolderScan {
-    param([string]$Name, [string]$FolderPath, [System.Xml.XmlReaderSettings]$Settings)
+    param(
+        [string]$Name, [string]$FolderPath, [System.Xml.XmlReaderSettings]$Settings,
+        [string]$Typ = 'Ordner', [bool]$CheckModDesc = $true, [bool]$CheckReferences = $true
+    )
 
     $results = New-Object System.Collections.Generic.List[object]
     $count   = 0
 
-    # -Filter ist der schnelle Vorfilter des Dateisystems, matcht ueber die 8.3-Kurznamen aber
-    # auch '.xmlbak' - deshalb die Extension danach exakt pruefen.
-    $xmlFiles = @(Get-ChildItem -LiteralPath $FolderPath -Recurse -File -Filter '*.xml' -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Extension -eq '.xml' })
+    # Einmal alle Dateien einlesen: daraus entstehen sowohl die XML-Liste als auch der Index der
+    # tatsaechlich vorhandenen Dateien fuer die Verweispruefung.
+    $allFiles = @(Get-ChildItem -LiteralPath $FolderPath -Recurse -File -ErrorAction SilentlyContinue)
+
+    $present = New-Object 'System.Collections.Generic.Dictionary[string, string]'
+    foreach ($f in $allFiles) {
+        $rel = ($f.FullName.Substring($FolderPath.Length + 1)) -replace '\\', '/'
+        $present[$rel.ToLowerInvariant()] = $rel
+    }
+
+    $modDescAtRoot = $present.ContainsKey('moddesc.xml')
+    # Verweise nur pruefen, wenn der Mod normal gepackt ist - sonst laesst sich die Mod-Wurzel
+    # nicht bestimmen und jeder Verweis waere ein Fehlalarm (der Mod laedt ohnehin nicht).
+    $doRefs = $CheckReferences -and $modDescAtRoot
+
+    # 8.3-Kurznamen koennen ueber den Vorfilter auch '.xmlbak' hereinlassen - Extension exakt pruefen.
+    $xmlFiles = @($allFiles | Where-Object { $_.Extension -eq '.xml' })
 
     foreach ($file in $xmlFiles) {
         $count++
         $check = Test-XmlFile -FilePath $file.FullName -Settings $Settings
-        if ($check.Ok) { continue }
 
-        $hints = Get-XmlHint -Text (Read-FileText -FilePath $file.FullName)
+        $hints = New-Object System.Collections.Generic.List[object]
+        if (-not $check.Ok) {
+            $hints = Get-XmlHint -Text (Read-FileText -FilePath $file.FullName)
+        }
+        elseif ($doRefs) {
+            $text = Read-FileText -FilePath $file.FullName
+            if ($text) {
+                $rel     = ($file.FullName.Substring($FolderPath.Length + 1)) -replace '\\', '/'
+                $baseDir = if ($rel -match '/') { $rel.Substring(0, $rel.LastIndexOf('/') + 1) } else { '' }
+                $hints   = Get-ReferenceFinding -Text $text -LineStarts (Get-LineStartIndex -Text $text) -Present $present -BaseDir $baseDir
+            }
+        }
 
-        $results.Add((New-XmlResult -Mod $Name -Typ 'Ordner' `
+        if ($check.Ok -and $hints.Count -eq 0) { continue }   # wohlgeformt und ohne Verweisproblem
+
+        $results.Add((New-XmlResult -Mod $Name -Typ $Typ `
             -Datei $file.FullName.Substring($FolderPath.Length + 1) `
             -IstModDesc ($file.Name -eq 'modDesc.xml') `
             -Check $check -Hints $hints -VollerPfad $file.FullName))
     }
 
-    $modDesc = if (Test-Path -LiteralPath (Join-Path $FolderPath 'modDesc.xml')) { 'Ok' }
-               else { 'keine modDesc.xml gefunden' }
+    $modDesc = if     (-not $CheckModDesc) { 'Ok' }
+               elseif ($modDescAtRoot)     { 'Ok' }
+               else                        { 'keine modDesc.xml gefunden' }
 
     return [pscustomobject]@{ Results = $results; FileCount = $count; ModDesc = $modDesc }
 }
 
 function Invoke-ZipScan {
-    param([string]$Name, [string]$ZipPath, [System.Xml.XmlReaderSettings]$Settings)
+    param(
+        [string]$Name, [string]$ZipPath, [System.Xml.XmlReaderSettings]$Settings,
+        [bool]$CheckReferences = $true
+    )
 
     $results = New-Object System.Collections.Generic.List[object]
     $count   = 0
@@ -480,13 +677,16 @@ function Invoke-ZipScan {
     }
 
     try {
+        # Erst den Datei-Index (fuer die Verweispruefung) und den modDesc-Status bestimmen; im
+        # Zip trennt immer '/', unabhaengig vom Betriebssystem des Packers.
+        $present = New-Object 'System.Collections.Generic.Dictionary[string, string]'
         $modDesc = 'keine modDesc.xml gefunden'
 
         foreach ($entry in $archive.Entries) {
-            # Ordnereintraege haben einen leeren Name.
-            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }   # Ordnereintraege
 
-            # Im Zip trennt immer '/', unabhaengig vom Betriebssystem des Packers.
+            $present[$entry.FullName.ToLowerInvariant()] = $entry.FullName
+
             if ($entry.Name -ieq 'modDesc.xml') {
                 if ($entry.FullName -ieq 'modDesc.xml') {
                     $modDesc = 'Ok'
@@ -496,14 +696,31 @@ function Invoke-ZipScan {
                     $modDesc = "modDesc.xml liegt in '$sub' statt im Zip-Wurzelverzeichnis - einmal zu viel gezippt"
                 }
             }
+        }
 
+        # Verweise nur bei normal gepacktem Mod pruefen (modDesc.xml im Wurzelverzeichnis).
+        $doRefs = $CheckReferences -and ($modDesc -eq 'Ok')
+
+        foreach ($entry in $archive.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
             if (-not $entry.Name.EndsWith('.xml', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
 
             $count++
             $check = Test-XmlZipEntry -Entry $entry -Settings $Settings
-            if ($check.Ok) { continue }
 
-            $hints = Get-XmlHint -Text (Read-ZipEntryText -Entry $entry)
+            $hints = New-Object System.Collections.Generic.List[object]
+            if (-not $check.Ok) {
+                $hints = Get-XmlHint -Text (Read-ZipEntryText -Entry $entry)
+            }
+            elseif ($doRefs) {
+                $text = Read-ZipEntryText -Entry $entry
+                if ($text) {
+                    $baseDir = if ($entry.FullName -match '/') { $entry.FullName.Substring(0, $entry.FullName.LastIndexOf('/') + 1) } else { '' }
+                    $hints   = Get-ReferenceFinding -Text $text -LineStarts (Get-LineStartIndex -Text $text) -Present $present -BaseDir $baseDir
+                }
+            }
+
+            if ($check.Ok -and $hints.Count -eq 0) { continue }
 
             $results.Add((New-XmlResult -Mod $Name -Typ 'Zip' -Datei $entry.FullName `
                 -IstModDesc ($entry.Name -ieq 'modDesc.xml') `
@@ -575,10 +792,10 @@ foreach ($mod in $modItems) {
                    -PercentComplete (($modIndex / [Math]::Max($modItems.Count, 1)) * 100)
 
     $scan = if ($mod.Typ -eq 'Zip') {
-        Invoke-ZipScan -Name $mod.Name -ZipPath $mod.Path -Settings $settings
+        Invoke-ZipScan -Name $mod.Name -ZipPath $mod.Path -Settings $settings -CheckReferences (-not $SkipReferenceCheck)
     }
     else {
-        Invoke-FolderScan -Name $mod.Name -FolderPath $mod.Path -Settings $settings
+        Invoke-FolderScan -Name $mod.Name -FolderPath $mod.Path -Settings $settings -CheckReferences (-not $SkipReferenceCheck)
     }
 
     foreach ($r in $scan.Results) { $results.Add($r) }
@@ -590,14 +807,38 @@ foreach ($mod in $modItems) {
 }
 
 Write-Progress -Activity 'XML-Pruefung' -Completed
+
+# Optional: das aktive Savegame mitpruefen. Reine Wohlgeformtheit - keine Verweise, keine modDesc.
+$savegameFileCount = 0
+if ($SavegamePath) {
+    if (Test-Path -LiteralPath $SavegamePath -PathType Container) {
+        $saveRoot = (Resolve-Path -LiteralPath $SavegamePath).ProviderPath
+        $saveScan = Invoke-FolderScan -Name '(Savegame)' -FolderPath $saveRoot -Settings $settings `
+                        -Typ 'Savegame' -CheckModDesc $false -CheckReferences $false
+        foreach ($r in $saveScan.Results) { $results.Add($r) }
+        $fileCount        += $saveScan.FileCount
+        $savegameFileCount = $saveScan.FileCount
+    }
+    else {
+        Write-Host "Savegame-Verzeichnis nicht gefunden: $SavegamePath" -ForegroundColor Red
+    }
+}
+
 $sw.Stop()
 
 # ------------------------------------------------------------------------------------------------
 # Ausgabe
 # ------------------------------------------------------------------------------------------------
 
+# Harte Fehler = echte XML-Parserfehler (setzen den Exitcode). Verweis-Funde sind Hinweise:
+# eine fehlende .dds blockiert den Serverstart in aller Regel nicht.
+$hardErrors = @($results | Where-Object { $_.ParserFehler -or $_.Zeile -gt 0 })
+$advisories = @($results | Where-Object { -not ($_.ParserFehler -or $_.Zeile -gt 0) })
+
 Write-Host ("-" * 96) -ForegroundColor DarkGray
-Write-Host "Geprueft: $fileCount XML-Dateien in $($modItems.Count) Mods  ($([math]::Round($sw.Elapsed.TotalSeconds,1)) s)"
+$geprueft = "Geprueft: $fileCount XML-Dateien in $($modItems.Count) Mods"
+if ($savegameFileCount -gt 0) { $geprueft += " (davon $savegameFileCount im Savegame)" }
+Write-Host "$geprueft  ($([math]::Round($sw.Elapsed.TotalSeconds,1)) s)"
 Write-Host ("-" * 96) -ForegroundColor DarkGray
 Write-Host ''
 
@@ -607,7 +848,12 @@ if ($results.Count -eq 0) {
 else {
     $brokenMods = $results | Group-Object Mod | Sort-Object Name
 
-    Write-Host "$($results.Count) fehlerhafte XML-Datei(en) in $($brokenMods.Count) Mod(s):" -ForegroundColor Red
+    if ($hardErrors.Count -gt 0) {
+        Write-Host "$($hardErrors.Count) fehlerhafte XML-Datei(en) (Parserfehler):" -ForegroundColor Red
+    }
+    if ($advisories.Count -gt 0) {
+        Write-Host "$($advisories.Count) Datei(en) mit Verweis-Hinweisen (kein Parserfehler, blockiert den Exitcode nicht)." -ForegroundColor DarkYellow
+    }
     Write-Host ''
 
     foreach ($group in $brokenMods) {
@@ -620,7 +866,7 @@ else {
             if ($r.Zeile -gt 0) {
                 Write-Host "      Parser   Zeile $($r.Zeile), Spalte $($r.Spalte): $($r.ParserFehler)" -ForegroundColor Red
             }
-            else {
+            elseif ($r.ParserFehler) {
                 Write-Host "      Parser   $($r.ParserFehler)" -ForegroundColor Red
             }
 
@@ -631,7 +877,8 @@ else {
                     Write-Host "      ...      und $rest weitere gleichartige Fundstelle(n) - vollstaendig via -CsvPath" -ForegroundColor DarkGray
                     break
                 }
-                Write-Host "      Ursache  Zeile $($h.Line): $($h.Kind)" -ForegroundColor Magenta
+                $ort = if ($h.Line -gt 0) { "Zeile $($h.Line): " } else { '' }
+                Write-Host "      Ursache  $ort$($h.Kind)" -ForegroundColor Magenta
                 Write-Host "               $($h.Text)" -ForegroundColor DarkGray
                 $shown++
             }
@@ -695,4 +942,5 @@ if ($IncludeOk) {
 
 if ($PassThru) { $results }
 
-exit $(if ($results.Count -gt 0) { 1 } else { 0 })
+# Nur echte Parserfehler blockieren den Reboot-Gate; Verweis-Hinweise werden nur gemeldet.
+exit $(if ($hardErrors.Count -gt 0) { 1 } else { 0 })
